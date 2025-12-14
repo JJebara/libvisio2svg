@@ -214,6 +214,11 @@ int main(int argc, char **argv) {
 Changelog
 =========
 
+0.5.8
+-----
+
+* Better argp build handling (cmake findpackage) on MacOS
+
 0.5.7
 -----
 
