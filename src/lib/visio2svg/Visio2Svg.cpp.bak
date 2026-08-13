@@ -671,23 +671,24 @@ int convert_iterator(xmlNode *a_node, xmlDocPtr root_doc) {
 int Visio2Svg::scale_title(xmlNode **root, xmlDocPtr *doc, double scaling,
                            const xmlChar *title, int title_len) {
     int ret = 0;
+    // create a group with transform="scale(<scaling>)" attribute
+    xmlNode *node = xmlNewNode(NULL, (const xmlChar *)"g");
+    size_t tlen = (size_t)snprintf(NULL, 0, " scale(%f)  ", scaling);
+    char *translate = (char *)malloc(tlen);
+    tlen = snprintf(translate, tlen, " scale(%f)  ", scaling);
+    xmlNewProp(node, (const xmlChar *)"transform", (const xmlChar *)translate);
 
     xmlNode *new_root = xmlNewNode(NULL, (const xmlChar *)"svg");
     xmlAttr *attribute = (*root)->properties;
+    double width = 0;
+    double height = 0;
     while (attribute) {
         xmlChar *value = xmlNodeListGetString(*doc, attribute->children, 1);
         if ((!xmlStrcmp(attribute->name, (const xmlChar *)"width")) ||
             (!xmlStrcmp(attribute->name, (const xmlChar *)"height"))) {
-            // atof() only consumes the leading numeric portion of the
-            // string. librevenge emits width/height with a unit suffix
-            // (e.g. "0.317in"), so capture whatever text trails the
-            // number via strtod()'s endptr and re-append it -- otherwise
-            // the unit is silently dropped and the resulting bare number
-            // gets interpreted by SVG viewers as unitless pixels.
-            char *endptr = NULL;
-            double geom = strtod((const char *)value, &endptr);
-            char *cgeom = (char *)calloc(1, 64);
-            snprintf(cgeom, 64, "%.10f%s", geom * scaling, endptr);
+            double geom = atof((const char *)value);
+            char *cgeom = (char *)calloc(1, 50);
+            snprintf(cgeom, 50, "%.10f", geom * scaling);
             xmlNewProp(new_root, attribute->name, (const xmlChar *)cgeom);
             free(cgeom);
         } else {
@@ -709,21 +710,13 @@ int Visio2Svg::scale_title(xmlNode **root, xmlDocPtr *doc, double scaling,
         xmlNewChild(new_root, NULL, (const xmlChar *)"title", NULL);
     xmlAddChild(title_node, title_cdata);
     xmlDocSetRootElement(new_doc, new_root);
-    // Do NOT also wrap the content in a scale() transform here. width/
-    // height above are already multiplied by `scaling`, which on its own
-    // is the complete, correct way to resize an SVG's physical/display
-    // size: viewers automatically stretch the (unchanged) viewBox
-    // coordinate space to fill whatever width/height is given. Adding a
-    // second scale() transform on top of that re-applies the same
-    // factor twice, so every path coordinate ends up `scaling`x outside
-    // the untouched viewBox for any scaling != 1.0 -- i.e. the whole
-    // drawing renders off-canvas (blank) whenever -s is used with a
-    // value other than 1.
     xmlNode *children = xmlCopyNodeList((*root)->children);
-    xmlAddChildList(new_root, children);
+    xmlAddChildList(new_root, node);
+    xmlAddChildList(node, children);
     xmlFreeDoc(*doc);
     *doc = new_doc;
     *root = new_root;
+    free(translate);
     return ret;
 }
 
