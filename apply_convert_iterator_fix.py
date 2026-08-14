@@ -1,445 +1,40 @@
-/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+#!/usr/bin/env python3
+"""
+apply_convert_iterator_fix.py
 
-#include "visio2svg/Visio2Svg.h"
-#include "visio2svg/TitleGenerator.h"
-#include <emf2svg.h>
-#include <iostream>
-#include <librevenge-generators/librevenge-generators.h>
-#include <librevenge-stream/librevenge-stream.h>
-#include <librevenge/librevenge.h>
-#include <libvisio/libvisio.h>
-#include <libwmf/api.h>
-#include <libwmf/ipa.h>
-#include <libwmf/svg.h>
-#include <libxml/parser.h>
-#include <libxml/tree.h>
-#include <math.h>
-#include <sstream>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string>
-#include <string>
-#include <sys/types.h>
-#include <unordered_map>
+Fixes the emf-blob "chopped off / content pushed outside the viewBox" bug:
+convert_iterator() was reapplying the original <image> placeholder's (x,y)
+offset on top of emf2svg output that's sometimes already rendered in final,
+page-absolute coordinates. This inserts bounding-box/overlap helper
+functions and replaces convert_iterator() with a version that only keeps
+the translate when it doesn't make the fit against the viewBox worse.
 
-#ifdef DARWIN
-#include "memstream.c"
-#endif
+This locates code by function signature and brace-matching (not by line
+number or literal whitespace), so it's safe to run regardless of
+tabs-vs-spaces or any other formatting differences in your checkout --
+same approach as apply_scale_title_fix.py.
 
-#define VISIOVSS 1
-#define VISIOVSD 2
+Usage:
+    python3 apply_convert_iterator_fix.py /path/to/src/lib/visio2svg/Visio2Svg.cpp
 
-#define WHITESPACE 64
-#define EQUALS 65
-#define INVALID 66
-#define WMF2SVG_MAXPECT (1 << 0)
+Writes a Visio2Svg.cpp.bak2 backup before modifying anything. Safe to run
+after (or before) apply_scale_title_fix.py -- the two touch different
+functions and don't conflict.
+"""
 
-#include <algorithm>
+import re
+import sys
+from pathlib import Path
+
+INCLUDES_BLOCK = """#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <vector>
+"""
 
-namespace visio2svg {
+HELPERS_MARKER = "BEGIN translate-safety helpers"
 
-static void or_wmf_svg_device_begin(wmfAPI *API) {
-    wmf_svg_t *ddata = WMF_SVG_GetData(API);
-
-    wmfStream *out = ddata->out;
-
-    if (out == 0)
-        return;
-
-    if ((out->reset(out->context)) &&
-        ((API->flags & WMF_OPT_IGNORE_NONFATAL) == 0)) {
-        API->err = wmf_E_DeviceError;
-        return;
-    }
-
-    if ((ddata->bbox.BR.x <= ddata->bbox.TL.x) ||
-        (ddata->bbox.BR.y <= ddata->bbox.TL.y)) {
-        API->err = wmf_E_Glitch;
-        return;
-    }
-
-    if ((ddata->width == 0) || (ddata->height == 0)) {
-        ddata->width = (unsigned int)ceil(ddata->bbox.BR.x - ddata->bbox.TL.x);
-        ddata->height = (unsigned int)ceil(ddata->bbox.BR.y - ddata->bbox.TL.y);
-    }
-
-    wmf_stream_printf(API, out, (char *)"<g>\n");
-
-    if (ddata->Description) {
-        wmf_stream_printf(API, out, (char *)"<desc>%s</desc>\n",
-                          ddata->Description);
-    }
-}
-
-/* This is called from the end of each play for page termination
- */
-static void or_wmf_svg_device_end(wmfAPI *API) {
-    wmf_svg_t *ddata = WMF_SVG_GetData(API);
-
-    wmfStream *out = ddata->out;
-    wmf_stream_printf(API, out, (char *)"</g>\n");
-
-    WMF_DEBUG(API, "~~~~~~~~wmf_[svg_]device_end");
-
-    if (out == 0)
-        return;
-}
-
-Visio2Svg::Visio2Svg() {
-}
-
-Visio2Svg::~Visio2Svg() {
-}
-
-typedef struct _ImageContext ImageContext;
-
-struct _ImageContext {
-    int number;
-    char *prefix;
-};
-
-int Visio2Svg::vss2svg(std::string &in,
-                       std::unordered_map<std::string, std::string> &out,
-                       double scaling) {
-    return visio2svg(in, out, scaling, VISIOVSS);
-}
-
-int Visio2Svg::vss2svg(std::string &in,
-                       std::unordered_map<std::string, std::string> &out) {
-    return visio2svg(in, out, 1.0, VISIOVSS);
-}
-
-int Visio2Svg::vsd2svg(std::string &in,
-                       std::unordered_map<std::string, std::string> &out) {
-    return visio2svg(in, out, 1.0, VISIOVSD);
-}
-
-int Visio2Svg::vsd2svg(std::string &in,
-                       std::unordered_map<std::string, std::string> &out,
-                       double scaling) {
-    return visio2svg(in, out, scaling, VISIOVSD);
-}
-
-int explicit_wmf_error(char const *str, wmf_error_t err) {
-    int status = 0;
-
-    switch (err) {
-    case wmf_E_None:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned with wmf_E_None.\n", str);
-#endif
-        status = 0;
-        break;
-
-    case wmf_E_InsMem:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned with wmf_E_InsMem.\n", str);
-#endif
-        status = 1;
-        break;
-
-    case wmf_E_BadFile:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned with wmf_E_BadFile.\n", str);
-#endif
-        status = 1;
-        break;
-
-    case wmf_E_BadFormat:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned with wmf_E_BadFormat.\n", str);
-#endif
-        status = 1;
-        break;
-
-    case wmf_E_EOF:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned with wmf_E_EOF.\n", str);
-#endif
-        status = 1;
-        break;
-
-    case wmf_E_DeviceError:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned with wmf_E_DeviceError.\n", str);
-#endif
-        status = 1;
-        break;
-
-    case wmf_E_Glitch:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned with wmf_E_Glitch.\n", str);
-#endif
-        status = 1;
-
-    case wmf_E_Assert:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned with wmf_E_Assert.\n", str);
-#endif
-        status = 1;
-        break;
-
-    default:
-#ifdef DEBUG
-        fprintf(stderr, "%s returned unexpected value.\n", str);
-#endif
-        status = 1;
-        break;
-    }
-
-    return (status);
-}
-
-int wmf2svg_draw(char *content, size_t size, float wmf_width, float wmf_height,
-                 char **out, size_t *out_length) {
-    int status = 0;
-
-    unsigned long flags;
-
-    FILE *out_f;
-    out_f = open_memstream(out, out_length);
-
-    ImageContext IC;
-
-    wmf_error_t err;
-
-    wmf_svg_t *ddata = 0;
-
-    wmfAPI *API = 0;
-    wmfD_Rect bbox;
-
-    wmfAPI_Options api_options;
-
-    flags = 0;
-
-    flags |= WMF_OPT_FUNCTION;
-    flags |= WMF_OPT_IGNORE_NONFATAL;
-
-    api_options.function = wmf_svg_function;
-
-    err = wmf_api_create(&API, flags, &api_options);
-    status = explicit_wmf_error("wmf_api", err);
-
-    wmfFunctionReference *FR = (wmfFunctionReference *)API->function_reference;
-
-    FR->device_begin = or_wmf_svg_device_begin;
-    FR->device_end = or_wmf_svg_device_end;
-
-    if (status) {
-        if (API)
-            wmf_api_destroy(API);
-        return (status);
-    }
-
-    err = wmf_mem_open(API, (unsigned char *)content, (long)size);
-    status = explicit_wmf_error("open", err);
-
-    if (status) {
-        wmf_api_destroy(API);
-        return (status);
-    }
-
-    err = wmf_scan(API, 0, &bbox);
-    status = explicit_wmf_error("scan", err);
-
-    if (status) {
-        wmf_api_destroy(API);
-        return (status);
-    }
-
-    ddata = WMF_SVG_GetData(API);
-
-    float width;
-    float height;
-    wmf_size(API, &width, &height);
-
-    if ((width <= 0) || (height <= 0)) {
-#ifdef DEBUG
-        fprintf(stderr, "Bad image size - but this error shouldn't occur...\n");
-#endif
-        status = 1;
-        wmf_api_destroy(API);
-        return (status);
-    }
-
-    // ddata->type = wmf_gd_jpeg;
-
-    // ddata->flags |= WMF_SVG_OUTPUT_FILE;
-    ddata->out = wmf_stream_create(API, out_f);
-
-    ddata->bbox = bbox;
-    ddata->width = wmf_width;
-    ddata->height = wmf_height;
-    ddata->flags |= WMF_SVG_INLINE_IMAGES;
-
-    wmfD_Rect d_r;
-    if (status == 0) {
-        err = wmf_play(API, 0, &d_r);
-        status = explicit_wmf_error("play", err);
-    }
-
-    fclose(out_f);
-    wmf_api_destroy(API);
-
-#ifdef DEBUG
-    printf("%d, %d\n", err, status);
-#endif
-    return (status);
-}
-
-int Visio2Svg::visio2svg(std::string &in,
-                         std::unordered_map<std::string, std::string> &out,
-                         double scaling, int mode) {
-    librevenge::RVNGStringStream input((const unsigned char *)in.c_str(),
-                                       in.size());
-
-    // check document type
-    if (!libvisio::VisioDocument::isSupported(&input)) {
-#ifdef DEBUG
-        std::cerr << "ERROR: Unsupported file format (unsupported version) or "
-                     "file is encrypted!"
-                  << std::endl;
-#endif
-        return 1;
-    }
-
-    // Reset stream position after isSupported check
-    input.seek(0, librevenge::RVNG_SEEK_SET);
-
-    int ret = 0;
-
-    // Recover Titles of each sheets
-    librevenge::RVNGStringVector output_names;
-    visio2svg::TitleGenerator generator_names(output_names);
-    if (mode == VISIOVSS) {
-        ret = libvisio::VisioDocument::parseStencils(&input, &generator_names);
-    } else {
-        ret = libvisio::VisioDocument::parse(&input, &generator_names);
-    }
-
-    if (!ret || output_names.empty()) {
-#ifdef DEBUG
-        std::cerr << "ERROR: Failed to recover sheets titles failed!"
-                  << std::endl;
-#endif
-        return 1;
-    }
-
-    // Reset stream position before second parse
-    input.seek(0, librevenge::RVNG_SEEK_SET);
-
-    // Convert vss/vsd to SVG
-    librevenge::RVNGStringVector output;
-    librevenge::RVNGSVGDrawingGenerator generator(output, NULL);
-    if (mode == VISIOVSS) {
-        ret = libvisio::VisioDocument::parseStencils(&input, &generator);
-    } else {
-        ret = libvisio::VisioDocument::parse(&input, &generator);
-    }
-    if (!ret || output.empty()) {
-#ifdef DEBUG
-        std::cerr << "ERROR: SVG Generation failed!" << std::endl;
-#endif
-        return 1;
-    }
-    ret = 0;
-
-    // Post Treatment loop and construction of the output hash table
-    for (unsigned k = 0; k < output.size(); ++k) {
-        char *post_treated = NULL;
-        // Convert <image> tag containing emf blobs
-        // and resize image
-        ret |= postTreatement(&output[k], &output_names[k], &post_treated,
-                              scaling);
-        std::string title;
-        if (output_names[k].empty()) {
-            title = "no_title_" + std::to_string(k);
-        } else {
-            title = output_names[k].cstr();
-        }
-        std::pair<std::string, std::string> item(title,
-                                                 std::string(post_treated));
-        // output[k].cstr());
-        free(post_treated);
-        out.insert(item);
-    }
-    return ret;
-}
-
-// base64 decoder
-// just copy paste from
-// https://en.wikibooks.org/wiki/Algorithm_Implementation/Miscellaneous/Base64
-static const unsigned char d[] = {
-    66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 64, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 62, 66, 66, 66, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-    61, 66, 66, 66, 65, 66, 66, 66, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
-    11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 66, 66, 66, 66,
-    66, 66, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
-    43, 44, 45, 46, 47, 48, 49, 50, 51, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-    66, 66, 66, 66, 66, 66, 66, 66, 66};
-int base64decode(char *in, size_t inLen, unsigned char *out, size_t *outLen) {
-    char *end = in + inLen;
-    char iter = 0;
-    size_t buf = 0, len = 0;
-
-    while (in < end) {
-        unsigned char c = d[*in++];
-
-        switch (c) {
-        case WHITESPACE:
-            continue; /* skip whitespace */
-        case INVALID:
-            return 1; /* invalid input, return error */
-        case EQUALS:  /* pad character, end of data */
-            in = end;
-            continue;
-        default:
-            buf = buf << 6 | c;
-            iter++; // increment the number of iteration
-            /* If the buffer is full, split it into bytes */
-            if (iter == 4) {
-                if ((len += 3) > *outLen)
-                    return 1; /* buffer overflow */
-                *(out++) = (buf >> 16) & 255;
-                *(out++) = (buf >> 8) & 255;
-                *(out++) = buf & 255;
-                buf = 0;
-                iter = 0;
-            }
-        }
-    }
-
-    if (iter == 3) {
-        if ((len += 2) > *outLen)
-            return 1; /* buffer overflow */
-        *(out++) = (buf >> 10) & 255;
-        *(out++) = (buf >> 2) & 255;
-    } else if (iter == 2) {
-        if (++len > *outLen)
-            return 1; /* buffer overflow */
-        *(out++) = (buf >> 4) & 255;
-    }
-
-    *outLen = len; /* modify to reflect the actual output size */
-    return 0;
-}
-
-// Recursive convert.
-// Parse each node of the svg generated by librevenge/libvisio.
-// If it encounters an <image> node, it checks if it's an emf blob
-// and replace it with the result of emf2svg put inside a <g> node
-// with proper translate() to get proper position.
-// ===========================================================================
+HELPERS_BLOCK = '''// ===========================================================================
 // BEGIN translate-safety helpers (fix: erroneous emf-blob translate() that
 // pushes already-correctly-positioned content outside the document viewBox)
 // ===========================================================================
@@ -789,7 +384,9 @@ static bool translate_is_harmful(const BBox &content, double vx, double vy,
 // END translate-safety helpers
 // ===========================================================================
 
-int convert_iterator(xmlNode *a_node, xmlDocPtr root_doc) {
+'''
+
+NEW_CONVERT_ITERATOR = '''int convert_iterator(xmlNode *a_node, xmlDocPtr root_doc) {
     xmlNode *cur_node = NULL;
     xmlNode *next_node;
     int ret = 0;
@@ -945,7 +542,7 @@ int convert_iterator(xmlNode *a_node, xmlDocPtr root_doc) {
                     memcpy(wrapped, "<g>", 3);
                     memcpy(wrapped + 3, svg_out, len_out);
                     memcpy(wrapped + 3 + len_out, "</g>", 4);
-                    wrapped[wrapped_len] = '\0';
+                    wrapped[wrapped_len] = '\\0';
                     doc = xmlReadMemory(wrapped, wrapped_len, NULL, NULL,
                                         XML_PARSE_RECOVER | XML_PARSE_NOBLANKS |
                                             XML_PARSE_NONET | XML_PARSE_NOERROR |
@@ -1046,99 +643,92 @@ int convert_iterator(xmlNode *a_node, xmlDocPtr root_doc) {
         cur_node = next_node;
     }
     return ret;
-}
+}'''
 
-int Visio2Svg::scale_title(xmlNode **root, xmlDocPtr *doc, double scaling,
-                           const xmlChar *title, int title_len) {
-    int ret = 0;
 
-    xmlNode *new_root = xmlNewNode(NULL, (const xmlChar *)"svg");
-    xmlAttr *attribute = (*root)->properties;
-    while (attribute) {
-        xmlChar *value = xmlNodeListGetString(*doc, attribute->children, 1);
-        if ((!xmlStrcmp(attribute->name, (const xmlChar *)"width")) ||
-            (!xmlStrcmp(attribute->name, (const xmlChar *)"height"))) {
-            // atof() only consumes the leading numeric portion of the
-            // string. librevenge emits width/height with a unit suffix
-            // (e.g. "0.317in"), so capture whatever text trails the
-            // number via strtod()'s endptr and re-append it -- otherwise
-            // the unit is silently dropped and the resulting bare number
-            // gets interpreted by SVG viewers as unitless pixels.
-            char *endptr = NULL;
-            double geom = strtod((const char *)value, &endptr);
-            char *cgeom = (char *)calloc(1, 64);
-            snprintf(cgeom, 64, "%.10f%s", geom * scaling, endptr);
-            xmlNewProp(new_root, attribute->name, (const xmlChar *)cgeom);
-            free(cgeom);
-        } else {
-            xmlNewProp(new_root, attribute->name, value);
-        }
-        attribute = attribute->next;
-        xmlFree(value);
-    }
+def find_function_span(text: str, start_idx: int):
+    brace_open = text.find("{", start_idx)
+    if brace_open == -1:
+        return None
+    depth = 0
+    i = brace_open
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return (start_idx, i + 1)
+        i += 1
+    return None
 
-    xmlNsPtr ns = (*root)->nsDef;
-    while (ns) {
-        xmlNewNs(new_root, ns->href, ns->prefix);
-        ns = ns->next;
-    }
 
-    xmlDocPtr new_doc = xmlCopyDoc(*doc, 0);
-    xmlNodePtr title_cdata = xmlNewCDataBlock(new_doc, title, title_len);
-    xmlNodePtr title_node =
-        xmlNewChild(new_root, NULL, (const xmlChar *)"title", NULL);
-    xmlAddChild(title_node, title_cdata);
-    xmlDocSetRootElement(new_doc, new_root);
-    // Do NOT also wrap the content in a scale() transform here. width/
-    // height above are already multiplied by `scaling`, which on its own
-    // is the complete, correct way to resize an SVG's physical/display
-    // size: viewers automatically stretch the (unchanged) viewBox
-    // coordinate space to fill whatever width/height is given. Adding a
-    // second scale() transform on top of that re-applies the same
-    // factor twice, so every path coordinate ends up `scaling`x outside
-    // the untouched viewBox for any scaling != 1.0 -- i.e. the whole
-    // drawing renders off-canvas (blank) whenever -s is used with a
-    // value other than 1.
-    xmlNode *children = xmlCopyNodeList((*root)->children);
-    xmlAddChildList(new_root, children);
-    xmlFreeDoc(*doc);
-    *doc = new_doc;
-    *root = new_root;
-    return ret;
-}
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python3 apply_convert_iterator_fix.py /path/to/Visio2Svg.cpp", file=sys.stderr)
+        sys.exit(1)
 
-int Visio2Svg::postTreatement(const librevenge::RVNGString *in,
-                              const librevenge::RVNGString *name, char **out,
-                              double scaling) {
-    xmlDocPtr doc;
-    xmlNode *root_element = NULL;
-    int ret = 0;
-// parse svg/xml generated by librevenge/libvisio with libxml2
-#ifdef DEBUG
-    std::cerr << "Converting: " << name->cstr() << std::endl;
-#endif
-    doc = xmlReadMemory(in->cstr(), in->size(), name->cstr(), NULL,
-                        XML_PARSE_RECOVER | XML_PARSE_NOBLANKS |
-                            XML_PARSE_NONET | XML_PARSE_HUGE);
-    root_element = xmlDocGetRootElement(doc);
-    xmlNodePtr comment = xmlNewDocComment(
-        doc, (const unsigned char *)"converted by libvisio2svg");
-    xmlAddChild(root_element, comment);
-    // convert blobs (wmf, emf, ...)
-    ret |= convert_iterator(root_element, doc);
-    scale_title(&root_element, &doc, scaling, (const xmlChar *)name->cstr(),
-                name->size());
+    path = Path(sys.argv[1])
+    if not path.is_file():
+        print(f"Not a file: {path}", file=sys.stderr)
+        sys.exit(1)
 
-    xmlBufferPtr nodeBuffer = xmlBufferCreate();
-    xmlNodeDump(nodeBuffer, doc, root_element, 0, 1);
-    // Dump the generated svg to out
-    *out = strdup((char *)xmlBufferContent(nodeBuffer));
-    // free some memory
-    xmlFreeDoc(doc);
-    xmlBufferFree(nodeBuffer);
-    xmlCleanupParser();
-    return ret;
-}
-}
+    text = path.read_text(encoding="utf-8")
+    original_text = text
 
-/* vim:set shiftwidth=4 softtabstop=4 noexpandtab: */
+    # --- 1. Insert required #includes above the namespace, if not present ---
+    if "#include <algorithm>" not in text:
+        ns_match = re.search(r"namespace\s+visio2svg\s*\{", text)
+        if not ns_match:
+            print("ERROR: could not find 'namespace visio2svg {' to insert includes before.", file=sys.stderr)
+            sys.exit(1)
+        insert_at = ns_match.start()
+        text = text[:insert_at] + INCLUDES_BLOCK + "\n" + text[insert_at:]
+
+    # --- 2. Locate convert_iterator() by signature + brace matching ---
+    sig_pattern = re.compile(r"int\s+convert_iterator\s*\(")
+    m = sig_pattern.search(text)
+    if not m:
+        print("ERROR: could not find 'int convert_iterator(' in this file.", file=sys.stderr)
+        sys.exit(1)
+
+    span = find_function_span(text, m.start())
+    if span is None:
+        print("ERROR: could not find the matching closing brace of convert_iterator().", file=sys.stderr)
+        sys.exit(1)
+    func_start, func_end = span
+
+    # --- 3. Insert the helper block immediately before convert_iterator, ---
+    #        unless it's already present (idempotent re-run).
+    if HELPERS_MARKER not in text:
+        text = text[:func_start] + HELPERS_BLOCK + text[func_start:]
+        # re-locate convert_iterator now that text shifted
+        m = sig_pattern.search(text)
+        span = find_function_span(text, m.start())
+        func_start, func_end = span
+
+    # --- 4. Replace convert_iterator's body with the fixed version ---
+    old_function = text[func_start:func_end]
+    if "final_x" in old_function:
+        print("convert_iterator() already looks patched (found 'final_x'). No changes made.")
+        sys.exit(0)
+
+    new_text = text[:func_start] + NEW_CONVERT_ITERATOR + text[func_end:]
+
+    if new_text == original_text:
+        print("No changes were necessary.")
+        sys.exit(0)
+
+    backup_path = path.with_suffix(path.suffix + ".bak2")
+    backup_path.write_text(original_text, encoding="utf-8")
+    path.write_text(new_text, encoding="utf-8")
+
+    print(f"Backed up original to: {backup_path}")
+    print(f"Patched: {path}")
+    print("Inserted translate-safety helpers and replaced convert_iterator().")
+    print("Please review the file and rebuild.")
+
+
+if __name__ == "__main__":
+    main()

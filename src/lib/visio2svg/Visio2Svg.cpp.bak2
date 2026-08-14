@@ -34,11 +34,6 @@
 #define INVALID 66
 #define WMF2SVG_MAXPECT (1 << 0)
 
-#include <algorithm>
-#include <cctype>
-#include <cstring>
-#include <vector>
-
 namespace visio2svg {
 
 static void or_wmf_svg_device_begin(wmfAPI *API) {
@@ -439,356 +434,6 @@ int base64decode(char *in, size_t inLen, unsigned char *out, size_t *outLen) {
 // If it encounters an <image> node, it checks if it's an emf blob
 // and replace it with the result of emf2svg put inside a <g> node
 // with proper translate() to get proper position.
-// ===========================================================================
-// BEGIN translate-safety helpers (fix: erroneous emf-blob translate() that
-// pushes already-correctly-positioned content outside the document viewBox)
-// ===========================================================================
-//
-// Background: convert_iterator() wraps each converted emf/wmf blob in a
-// <g transform="translate(x,y)"> using x,y taken directly from the original
-// <image> placeholder node. That's correct when the converted content is a
-// small icon meant to sit at an offset within a larger scene. But some EMF
-// blobs are already rendered by emf2svg in absolute, page-filling
-// coordinates -- for those, re-applying the placeholder's offset shifts the
-// whole drawing out of the SVG's viewBox (most visibly cutting off the top
-// when y is a large negative number).
-//
-// The helpers below compute the actual bounding box of the converted
-// content (correctly walking any nested transform="matrix(...)" the
-// converter itself emits), compare it against the document's viewBox with
-// and without the proposed translate, and only keep the translate when it
-// doesn't make the fit meaningfully worse. This mirrors the same heuristic
-// used in fix_emf_translate.py, now applied at conversion time instead of
-// as a postprocessing pass.
-//
-// NOTE: this block is inserted directly inside the existing
-// `namespace visio2svg { ... }` in this file -- it intentionally does NOT
-// open its own namespace.
-
-struct Mat2D {
-    double a, b, c, d, e, f;
-};
-
-static const Mat2D MAT_IDENTITY = {1, 0, 0, 1, 0, 0};
-
-static Mat2D mat_compose(const Mat2D &p, const Mat2D &c) {
-    Mat2D r;
-    r.a = p.a * c.a + p.c * c.b;
-    r.b = p.b * c.a + p.d * c.b;
-    r.c = p.a * c.c + p.c * c.d;
-    r.d = p.b * c.c + p.d * c.d;
-    r.e = p.a * c.e + p.c * c.f + p.e;
-    r.f = p.b * c.e + p.d * c.f + p.f;
-    return r;
-}
-
-static void mat_apply(const Mat2D &m, double x, double y, double &ox,
-                      double &oy) {
-    ox = m.a * x + m.c * y + m.e;
-    oy = m.b * x + m.d * y + m.f;
-}
-
-// Parses a transform="..." attribute value (matrix/translate/scale; rotate
-// and skew are not expected from emf2svg's output and are intentionally
-// left unhandled) into a single composed affine matrix.
-static Mat2D parse_transform(const char *value) {
-    Mat2D result = MAT_IDENTITY;
-    if (!value)
-        return result;
-    std::string s(value);
-    size_t pos = 0;
-    while (pos < s.size()) {
-        size_t open = s.find('(', pos);
-        if (open == std::string::npos)
-            break;
-        std::string func = s.substr(pos, open - pos);
-        while (!func.empty() && std::isspace((unsigned char)func.front()))
-            func.erase(func.begin());
-        while (!func.empty() && std::isspace((unsigned char)func.back()))
-            func.pop_back();
-        size_t close = s.find(')', open);
-        if (close == std::string::npos)
-            break;
-        std::string args = s.substr(open + 1, close - open - 1);
-        // args may be comma- and/or whitespace-separated
-        std::replace(args.begin(), args.end(), ',', ' ');
-        std::vector<double> nums;
-        {
-            std::stringstream ss(args);
-            double v;
-            while (ss >> v)
-                nums.push_back(v);
-        }
-        Mat2D local = MAT_IDENTITY;
-        if (func == "matrix" && nums.size() == 6) {
-            local.a = nums[0];
-            local.b = nums[1];
-            local.c = nums[2];
-            local.d = nums[3];
-            local.e = nums[4];
-            local.f = nums[5];
-        } else if (func == "translate") {
-            local.e = nums.size() > 0 ? nums[0] : 0.0;
-            local.f = nums.size() > 1 ? nums[1] : 0.0;
-        } else if (func == "scale") {
-            double sx = nums.size() > 0 ? nums[0] : 1.0;
-            double sy = nums.size() > 1 ? nums[1] : sx;
-            local.a = sx;
-            local.d = sy;
-        }
-        result = mat_compose(result, local);
-        pos = close + 1;
-    }
-    return result;
-}
-
-struct BBox {
-    double minx, miny, maxx, maxy;
-    bool valid;
-};
-
-static void bbox_extend(BBox &b, double x, double y) {
-    if (!b.valid) {
-        b.minx = b.maxx = x;
-        b.miny = b.maxy = y;
-        b.valid = true;
-        return;
-    }
-    if (x < b.minx)
-        b.minx = x;
-    if (x > b.maxx)
-        b.maxx = x;
-    if (y < b.miny)
-        b.miny = y;
-    if (y > b.maxy)
-        b.maxy = y;
-}
-
-// Small SVG path 'd' bounding-box parser. Handles M/L/H/V/C/S/Q/T/A/Z,
-// upper and lower case. Curve control points are folded into the bbox
-// (slightly looser than the true rendered bbox); that's fine here since
-// this is only used to decide whether a translate is harmful, not for
-// rendering.
-static BBox parse_path_bbox(const char *d) {
-    BBox bbox = {0, 0, 0, 0, false};
-    if (!d)
-        return bbox;
-
-    double cx = 0, cy = 0, sx = 0, sy = 0;
-    char cmd = 0;
-    std::vector<double> nums;
-
-    auto flush = [&]() {
-        if (!cmd)
-            return;
-        char upper = (char)std::toupper((unsigned char)cmd);
-        bool rel = std::islower((unsigned char)cmd);
-        if (upper == 'Z') {
-            cx = sx;
-            cy = sy;
-            return;
-        }
-        int argc = 0;
-        switch (upper) {
-        case 'M':
-        case 'L':
-        case 'T':
-            argc = 2;
-            break;
-        case 'H':
-        case 'V':
-            argc = 1;
-            break;
-        case 'C':
-            argc = 6;
-            break;
-        case 'S':
-        case 'Q':
-            argc = 4;
-            break;
-        case 'A':
-            argc = 7;
-            break;
-        default:
-            argc = 0;
-        }
-        if (argc == 0)
-            return;
-        bool first = true;
-        for (size_t i = 0; i + (size_t)argc <= nums.size(); i += argc) {
-            if (upper == 'M' || upper == 'L' || upper == 'T') {
-                double x = nums[i], y = nums[i + 1];
-                if (rel) {
-                    x += cx;
-                    y += cy;
-                }
-                cx = x;
-                cy = y;
-                if (upper == 'M' && first) {
-                    sx = cx;
-                    sy = cy;
-                }
-                bbox_extend(bbox, cx, cy);
-            } else if (upper == 'H') {
-                double x = nums[i];
-                cx = rel ? cx + x : x;
-                bbox_extend(bbox, cx, cy);
-            } else if (upper == 'V') {
-                double y = nums[i];
-                cy = rel ? cy + y : y;
-                bbox_extend(bbox, cx, cy);
-            } else if (upper == 'C' || upper == 'S' || upper == 'Q') {
-                for (int j = 0; j < argc; j += 2) {
-                    double x = nums[i + j], y = nums[i + j + 1];
-                    if (rel) {
-                        x += cx;
-                        y += cy;
-                    }
-                    bbox_extend(bbox, x, y);
-                    if (j == argc - 2) {
-                        cx = x;
-                        cy = y;
-                    }
-                }
-            } else if (upper == 'A') {
-                double x = nums[i + 5], y = nums[i + 6];
-                if (rel) {
-                    x += cx;
-                    y += cy;
-                }
-                cx = x;
-                cy = y;
-                bbox_extend(bbox, cx, cy);
-            }
-            first = false;
-        }
-    };
-
-    const char *p = d;
-    while (*p) {
-        if (std::strchr("MmLlHhVvCcSsQqTtAaZz", *p)) {
-            flush();
-            cmd = *p;
-            nums.clear();
-            p++;
-        } else if (std::isdigit((unsigned char)*p) || *p == '-' ||
-                   *p == '+' || *p == '.') {
-            char *end;
-            double v = strtod(p, &end);
-            if (end == p) {
-                p++;
-                continue;
-            }
-            nums.push_back(v);
-            p = end;
-        } else {
-            p++;
-        }
-    }
-    flush();
-    return bbox;
-}
-
-// Recursively walks a parsed XML fragment (as produced by emf2svg /
-// wmf2svg), composing nested transform="matrix(...)"/"translate(...)"/
-// "scale(...)" attributes, and merges in the bounding box of every <path>
-// element found.
-static void compute_content_bbox(xmlNode *node, const Mat2D &parentMat,
-                                 BBox &out) {
-    for (xmlNode *n = node; n; n = n->next) {
-        if (n->type != XML_ELEMENT_NODE)
-            continue;
-
-        xmlChar *transformAttr = xmlGetProp(n, (const xmlChar *)"transform");
-        Mat2D localMat = transformAttr
-                             ? parse_transform((const char *)transformAttr)
-                             : MAT_IDENTITY;
-        if (transformAttr)
-            xmlFree(transformAttr);
-        Mat2D combined = mat_compose(parentMat, localMat);
-
-        if (!xmlStrcmp(n->name, (const xmlChar *)"path")) {
-            xmlChar *dAttr = xmlGetProp(n, (const xmlChar *)"d");
-            if (dAttr) {
-                BBox local = parse_path_bbox((const char *)dAttr);
-                if (local.valid) {
-                    double x0, y0, x1, y1, x2, y2, x3, y3;
-                    mat_apply(combined, local.minx, local.miny, x0, y0);
-                    mat_apply(combined, local.minx, local.maxy, x1, y1);
-                    mat_apply(combined, local.maxx, local.miny, x2, y2);
-                    mat_apply(combined, local.maxx, local.maxy, x3, y3);
-                    bbox_extend(out, x0, y0);
-                    bbox_extend(out, x1, y1);
-                    bbox_extend(out, x2, y2);
-                    bbox_extend(out, x3, y3);
-                }
-                xmlFree(dAttr);
-            }
-        }
-
-        if (n->children)
-            compute_content_bbox(n->children, combined, out);
-    }
-}
-
-static bool get_root_viewbox(xmlDocPtr root_doc, double &vx, double &vy,
-                             double &vw, double &vh) {
-    xmlNode *root = xmlDocGetRootElement(root_doc);
-    if (!root)
-        return false;
-    xmlChar *vb = xmlGetProp(root, (const xmlChar *)"viewBox");
-    if (!vb)
-        return false;
-    int n = sscanf((const char *)vb, "%lf %lf %lf %lf", &vx, &vy, &vw, &vh);
-    xmlFree(vb);
-    return n == 4;
-}
-
-// Returns true if `content` already covers a large portion of the document
-// viewBox on its own, and applying (tx,ty) would make its overlap with the
-// viewBox meaningfully worse -- i.e. this translate is very likely the
-// "placeholder offset re-applied to already-final-position content" bug
-// rather than an intentional small-icon placement, which should be left
-// alone.
-static bool translate_is_harmful(const BBox &content, double vx, double vy,
-                                 double vw, double vh, double tx, double ty) {
-    if (!content.valid || vw <= 0 || vh <= 0)
-        return false;
-
-    double contentW = content.maxx - content.minx;
-    double contentH = content.maxy - content.miny;
-    double contentArea = contentW * contentH;
-    if (contentArea <= 0)
-        return false;
-
-    double viewArea = vw * vh;
-    double relativeSize = contentArea / viewArea;
-
-    auto overlapFraction = [&](double ox0, double oy0, double ox1,
-                               double oy1) {
-        double ix0 = std::max(ox0, vx), iy0 = std::max(oy0, vy);
-        double ix1 = std::min(ox1, vx + vw), iy1 = std::min(oy1, vy + vh);
-        double iw = std::max(0.0, ix1 - ix0), ih = std::max(0.0, iy1 - iy0);
-        return (iw * ih) / contentArea;
-    };
-
-    double overlapBefore =
-        overlapFraction(content.minx, content.miny, content.maxx, content.maxy);
-    double overlapAfter =
-        overlapFraction(content.minx + tx, content.miny + ty,
-                        content.maxx + tx, content.maxy + ty);
-
-    const double LARGE_CONTENT_THRESHOLD = 0.5; // >=50% of viewBox area
-    const double WORSE_OVERLAP_DROP = 0.15;     // >=15pt overlap drop
-
-    return (relativeSize >= LARGE_CONTENT_THRESHOLD) &&
-           ((overlapBefore - overlapAfter) >= WORSE_OVERLAP_DROP);
-}
-
-// ===========================================================================
-// END translate-safety helpers
-// ===========================================================================
-
 int convert_iterator(xmlNode *a_node, xmlDocPtr root_doc) {
     xmlNode *cur_node = NULL;
     xmlNode *next_node;
@@ -853,6 +498,46 @@ int convert_iterator(xmlNode *a_node, xmlDocPtr root_doc) {
             // else, just free the imgb64 and keep the node
             if (image_type != UNKNOWN_IMGTYPE) {
                 xmlAttr *attribute = cur_node->properties;
+                // create an svg group node (emf conversion will be put in it)
+                xmlNode *node = xmlNewNode(NULL, (const xmlChar *)"g");
+
+                // prepare translate to position emf conversion
+                // (inside transform attribute).
+                size_t tlen =
+                    (size_t)snprintf(NULL, 0, " translate(%f,%f)  ", x, y);
+                char *translate = (char *)malloc(tlen);
+                tlen = snprintf(translate, tlen, " translate(%f,%f)  ", x, y);
+                bool translate_set = false;
+
+                // copy all attributes of the image node in the group node
+                // except a few
+                while (attribute) {
+                    if (xmlStrcmp(attribute->name, (const xmlChar *)"href") &&
+                        xmlStrcmp(attribute->name, (const xmlChar *)"x") &&
+                        xmlStrcmp(attribute->name, (const xmlChar *)"y") &&
+                        xmlStrcmp(attribute->name, (const xmlChar *)"width") &&
+                        xmlStrcmp(attribute->name, (const xmlChar *)"height")) {
+                        xmlChar *value = xmlNodeListGetString(
+                            cur_node->doc, attribute->children, 1);
+                        // special treatement for transform, must append the
+                        // translate
+                        // previously prepared
+                        if ((!xmlStrcmp(attribute->name,
+                                        (const xmlChar *)"transform"))) {
+                            translate_set = true;
+                            value = xmlStrncat(
+                                value, (const xmlChar *)translate, tlen);
+                        }
+                        xmlNewProp(node, attribute->name, value);
+                    }
+                    attribute = attribute->next;
+                }
+                // if there was no "transform" attribute, add it with our
+                // translate
+                if (!(translate_set)) {
+                    xmlNewProp(node, (const xmlChar *)"transform",
+                               (const xmlChar *)translate);
+                }
 
                 // recover content (base64 encoded)
                 char *svg_out = NULL;
@@ -953,71 +638,6 @@ int convert_iterator(xmlNode *a_node, xmlDocPtr root_doc) {
                     free(wrapped);
                 }
                 root_element = xmlDocGetRootElement(doc);
-
-                // Decide whether to actually apply the placeholder's (x,y)
-                // translate, now that we can see where emf2svg/wmf2svg
-                // actually rendered the content. If the rendered content
-                // already fills most of the document's viewBox on its own,
-                // and applying (x,y) would push it substantially outside
-                // that viewBox, treat the translate as harmful and use
-                // (0,0) instead. See translate_is_harmful() above.
-                double final_x = x;
-                double final_y = y;
-                if (root_element) {
-                    BBox contentBBox = {0, 0, 0, 0, false};
-                    compute_content_bbox(root_element, MAT_IDENTITY,
-                                         contentBBox);
-                    double vx, vy, vw, vh;
-                    if (get_root_viewbox(root_doc, vx, vy, vw, vh) &&
-                        translate_is_harmful(contentBBox, vx, vy, vw, vh, x,
-                                             y)) {
-                        final_x = 0.0;
-                        final_y = 0.0;
-                    }
-                }
-
-                // create an svg group node (emf conversion will be put in it)
-                xmlNode *node = xmlNewNode(NULL, (const xmlChar *)"g");
-
-                // prepare translate to position emf conversion
-                // (inside transform attribute), using final_x/final_y
-                // rather than the raw placeholder x/y (see above).
-                size_t tlen = (size_t)snprintf(NULL, 0, " translate(%f,%f)  ",
-                                               final_x, final_y);
-                char *translate = (char *)malloc(tlen);
-                tlen = snprintf(translate, tlen, " translate(%f,%f)  ",
-                                final_x, final_y);
-                bool translate_set = false;
-
-                // copy all attributes of the image node in the group node
-                // except a few
-                while (attribute) {
-                    if (xmlStrcmp(attribute->name, (const xmlChar *)"href") &&
-                        xmlStrcmp(attribute->name, (const xmlChar *)"x") &&
-                        xmlStrcmp(attribute->name, (const xmlChar *)"y") &&
-                        xmlStrcmp(attribute->name, (const xmlChar *)"width") &&
-                        xmlStrcmp(attribute->name, (const xmlChar *)"height")) {
-                        xmlChar *value = xmlNodeListGetString(
-                            cur_node->doc, attribute->children, 1);
-                        // special treatement for transform, must append the
-                        // translate
-                        // previously prepared
-                        if ((!xmlStrcmp(attribute->name,
-                                        (const xmlChar *)"transform"))) {
-                            translate_set = true;
-                            value = xmlStrncat(
-                                value, (const xmlChar *)translate, tlen);
-                        }
-                        xmlNewProp(node, attribute->name, value);
-                    }
-                    attribute = attribute->next;
-                }
-                // if there was no "transform" attribute, add it with our
-                // translate
-                if (!(translate_set)) {
-                    xmlNewProp(node, (const xmlChar *)"transform",
-                               (const xmlChar *)translate);
-                }
 
                 xmlAddChild(node, s_sta);
 
