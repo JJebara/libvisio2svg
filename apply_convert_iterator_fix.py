@@ -26,8 +26,7 @@ import re
 import sys
 from pathlib import Path
 
-INCLUDES_BLOCK = """#include <algorithm>
-#include <cctype>
+INCLUDES_BLOCK = """#include <cctype>
 #include <cstring>
 #include <vector>
 """
@@ -65,6 +64,18 @@ struct Mat2D {
 };
 
 static const Mat2D MAT_IDENTITY = {1, 0, 0, 1, 0, 0};
+
+// NOTE: deliberately NOT std::min/std::max. On macOS this file pulls in
+// memstream.c (see the #ifdef DARWIN block near the top), which defines
+// old-style preprocessor macros named `min`/`max`. Those do blind textual
+// substitution, so even a qualified call like std::min(...) gets mangled
+// into invalid code (the `min` token inside `std::min` gets replaced
+// regardless of the `std::` prefix). Using differently-named helpers here
+// sidesteps that entirely instead of relying on #undef, which could have
+// side effects on other code in this file that intentionally uses the
+// bare min/max macros.
+static inline double d_min(double a, double b) { return (a < b) ? a : b; }
+static inline double d_max(double a, double b) { return (a > b) ? a : b; }
 
 static Mat2D mat_compose(const Mat2D &p, const Mat2D &c) {
     Mat2D r;
@@ -105,8 +116,13 @@ static Mat2D parse_transform(const char *value) {
         if (close == std::string::npos)
             break;
         std::string args = s.substr(open + 1, close - open - 1);
-        // args may be comma- and/or whitespace-separated
-        std::replace(args.begin(), args.end(), ',', ' ');
+        // args may be comma- and/or whitespace-separated. Manual loop
+        // instead of std::replace -- see the d_min/d_max note above for
+        // why this file avoids <algorithm> call sites where possible.
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (args[i] == ',')
+                args[i] = ' ';
+        }
         std::vector<double> nums;
         {
             std::stringstream ss(args);
@@ -361,9 +377,9 @@ static bool translate_is_harmful(const BBox &content, double vx, double vy,
 
     auto overlapFraction = [&](double ox0, double oy0, double ox1,
                                double oy1) {
-        double ix0 = std::max(ox0, vx), iy0 = std::max(oy0, vy);
-        double ix1 = std::min(ox1, vx + vw), iy1 = std::min(oy1, vy + vh);
-        double iw = std::max(0.0, ix1 - ix0), ih = std::max(0.0, iy1 - iy0);
+        double ix0 = d_max(ox0, vx), iy0 = d_max(oy0, vy);
+        double ix1 = d_min(ox1, vx + vw), iy1 = d_min(oy1, vy + vh);
+        double iw = d_max(0.0, ix1 - ix0), ih = d_max(0.0, iy1 - iy0);
         return (iw * ih) / contentArea;
     };
 
@@ -383,6 +399,7 @@ static bool translate_is_harmful(const BBox &content, double vx, double vy,
 // ===========================================================================
 // END translate-safety helpers
 // ===========================================================================
+
 
 '''
 
